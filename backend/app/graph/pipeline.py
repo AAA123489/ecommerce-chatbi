@@ -61,7 +61,7 @@ def build_graph(
         return {
             "metric_key": spec.key,
             "attempts": 0,
-            "guard_error": None,
+            "failure": None,
             "status": "running",
             "trace": [event("understand", f"匹配到 {spec.key}（{spec.name}）")],
         }
@@ -104,7 +104,7 @@ def build_graph(
                 registry,
                 bounds=executor.bounds(),
                 previous_sql=state.get("sql"),
-                error=state.get("guard_error"),
+                error=state.get("failure"),
             )
         except Exception as exc:
             return {
@@ -118,6 +118,10 @@ def build_graph(
         return {
             "sql": sql.strip(),
             "attempts": attempt,
+            # 空结果只给一次改写机会，记下来，第二回还是 0 行就认了
+            "empty_retried": state.get("empty_retried", False)
+            or _last_kind(state) == "empty_result",
+            "failure": None,
             "trace": [event("repair", f"第 {attempt} 次生成 SQL（修复）")],
         }
 
@@ -127,28 +131,47 @@ def build_graph(
             check(state["sql"] or "", spec, registry)
         except GuardError as exc:
             return {
-                "guard_error": exc.hint,
+                "failure": exc.hint,
+                "failures": [{"kind": "guard_fail", "detail": exc.code}],
                 "trace": [event("guard", f"未通过：{exc.code}")],
             }
         except Exception as exc:
             return {
-                "guard_error": str(exc),
+                "failure": str(exc),
+                "failures": [{"kind": "guard_fail", "detail": str(exc)[:120]}],
                 "trace": [event("guard", f"未通过：{exc}")],
             }
-        return {"guard_error": None, "trace": [event("guard", "通过")]}
+        return {"failure": None, "trace": [event("guard", "通过")]}
 
     def execute(state: AnalysisState) -> dict[str, Any]:
+        sql = state["sql"] or ""
         try:
-            result = executor.run(state["sql"] or "")
+            result = executor.run(sql)
         except Exception as exc:
+            hint = (
+                f"这条 SQL 执行时报错：{exc}\n"
+                f"按报错改正列名、函数或 JOIN；不要因此改动指标口径，"
+                f"必带的过滤和 JOIN 仍然要在。"
+            )
             return {
-                "status": "failed",
-                "answer": f"SQL 执行失败：{exc}",
-                "trace": [event("execute", f"失败：{exc}")],
+                "failure": hint,
+                "failures": [{"kind": "exec_error", "detail": str(exc)[:120]}],
+                "trace": [event("execute", f"报错：{exc}")],
             }
+
+        if result.row_count == 0:
+            return {
+                "columns": result.columns,
+                "rows": [],
+                "failure": _empty_hint(*executor.bounds()),
+                "failures": [{"kind": "empty_result", "detail": "0 行"}],
+                "trace": [event("execute", "0 行")],
+            }
+
         return {
             "columns": result.columns,
             "rows": result.rows,
+            "failure": None,
             "status": "ok",
             "trace": [
                 event("execute", f"{result.row_count} 行，{result.elapsed_ms:.0f} ms")
@@ -162,15 +185,17 @@ def build_graph(
         return {
             "answer": summarize_result(spec, columns, rows),
             "chart": build_chart(spec, columns, rows),
+            "status": "ok",
             "trace": [event("summarize", "结论只用结果里的数字拼，不经过模型")],
         }
 
     def give_up(state: AnalysisState) -> dict[str, Any]:
-        reason = state.get("guard_error") or state.get("answer") or "未知原因"
+        reason = state.get("failure") or state.get("answer") or "未知原因"
+        what = "合规" if _last_kind(state) == "guard_fail" else "能跑"
         return {
             "status": "failed",
             "answer": (
-                f"没能生成合规的 SQL（已尝试 {state.get('attempts', 0)} 次）。"
+                f"没能生成{what}的 SQL（已尝试 {state.get('attempts', 0)} 次）。"
                 f"最后一次的问题：{reason}"
             ),
             "trace": [event("give_up", "超过重试上限")],
@@ -185,9 +210,28 @@ def build_graph(
         return "guard" if state.get("sql") else "give_up"
 
     def after_guard(state: AnalysisState) -> str:
-        if not state.get("guard_error"):
+        if not state.get("failure"):
             return "execute"
         if state.get("attempts", 0) >= max_attempts:
+            return "give_up"
+        return "repair"
+
+    def after_execute(state: AnalysisState) -> str:
+        if not state.get("failure"):
+            return "summarize"
+
+        kind = _last_kind(state)
+        attempts = state.get("attempts", 0)
+
+        # 空结果不一定是错。2024 年就是没数据，硬改只会把答案改坏。
+        # 所以只给一次改写机会，改完还是 0 行就认了，照实说「没查到」。
+        if kind == "empty_result":
+            if state.get("empty_retried") or attempts >= max_attempts:
+                return "summarize"
+            return "repair"
+
+        # 执行报错是真错（列名不存在、类型不对），和守卫失败共用重试预算
+        if attempts >= max_attempts:
             return "give_up"
         return "repair"
 
@@ -222,7 +266,11 @@ def build_graph(
     graph.add_conditional_edges(
         "repair", after_generate, {"guard": "guard", "give_up": "give_up"}
     )
-    graph.add_edge("execute", "summarize")
+    graph.add_conditional_edges(
+        "execute",
+        after_execute,
+        {"summarize": "summarize", "repair": "repair", "give_up": "give_up"},
+    )
 
     for terminal in ("clarify", "summarize", "give_up"):
         graph.add_edge(terminal, END)
@@ -295,6 +343,21 @@ def _pick_value_column(
 
 
 _ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def _last_kind(state: AnalysisState) -> str | None:
+    failures = state.get("failures") or []
+    return failures[-1]["kind"] if failures else None
+
+
+def _empty_hint(start: Any, end: Any) -> str:
+    return (
+        f"这条 SQL 返回 0 行。数据覆盖 {start} ~ {end}，按顺序核对：\n"
+        f"1. 时间范围是否落在这个区间内（相对时间以数据末尾为基准）；\n"
+        f"2. 维度取值是不是「可用维度」里列出的原值，没有翻译或补全；\n"
+        f"3. 过滤条件是不是写得太严（比如把状态、渠道写死了）。\n"
+        f"如果问题本身就要查一段没有数据的区间，SQL 原样再输出一次即可。"
+    )
 
 
 def _count(rows: list[dict[str, Any]], label_columns: list[str]) -> str:

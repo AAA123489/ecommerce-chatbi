@@ -26,8 +26,12 @@ class AnalysisState(TypedDict, total=False):
 
     # 生成与修复
     sql: str | None
-    attempts: int          # 已经生成过几次 SQL
-    guard_error: str | None  # 上一次守卫给模型的修复提示
+    attempts: int           # 已经生成过几次 SQL
+    failure: str | None     # 上一次失败的原因，原样回填给模型
+    failures: Annotated[list[dict[str, Any]], operator.add]
+    #: 每次失败追加一条 {"kind": guard_fail | exec_error | empty_result, "detail": ...}
+    #: 评测按 kind 分桶算修复成功率，所以这里记全量，不是只记最后一次
+    empty_retried: bool     # 空结果是不是已经改写过一次了
 
     # 执行结果
     columns: list[str]

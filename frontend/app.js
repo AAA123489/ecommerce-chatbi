@@ -169,7 +169,7 @@ function addStep(step) {
   const label = NODE_LABELS[step.node] || step.node;
 
   if (step.node === "give_up") item.className = "fail";
-  else if (/未通过|失败|没能/.test(step.message)) item.className = "warn";
+  else if (/未通过|报错|失败|没能|0 行/.test(step.message)) item.className = "warn";
   else item.className = "ok";
 
   const name = document.createElement("span");

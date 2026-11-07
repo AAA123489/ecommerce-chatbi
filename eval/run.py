@@ -21,6 +21,7 @@ import argparse
 import json
 import sys
 import unicodedata
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,68 @@ def _pad(text: str, width: int) -> str:
     return str(text) + " " * max(0, width - _width(text))
 
 
+def _percentile(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(q * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def _print_stats(
+    timings: list[float],
+    repairs: list[tuple[list[str], bool]],
+    tokens: list[dict[str, int]],
+) -> None:
+    """通过率之外的三样东西：修复、耗时、调用量。
+
+    只看「30/30」说明不了链路稳不稳 —— 有一半题是修一次才对的，和一次就对的，
+    是两回事。
+    """
+    if not timings:
+        return
+
+    print("\n修复")
+    if not repairs:
+        print("  没有题目触发修复（每题第一次生成就通过）")
+    else:
+        kinds = ("guard_fail", "exec_error", "empty_result")
+        labels = {
+            "guard_fail": "口径校验未通过",
+            "exec_error": "执行报错",
+            "empty_result": "返回 0 行",
+        }
+        total = sum(len(k) for k, _ in repairs)
+        passed = sum(1 for _, ok in repairs if ok)
+        print(f"  触发 {total} 次，涉及 {len(repairs)} 题；这些题最终通过 {passed}/{len(repairs)}")
+        for kind in kinds:
+            hits = [ok for kinds_, ok in repairs if kind in kinds_]
+            if hits:
+                print(
+                    f"    {labels[kind]:<8} {len(hits):>2} 题"
+                    f"  通过 {sum(hits)}"
+                )
+
+    print("\n耗时（每题从提问到出结论）")
+    print(
+        f"  P50 {_percentile(timings, 0.5):.2f}s"
+        f"   P95 {_percentile(timings, 0.95):.2f}s"
+        f"   最慢 {max(timings):.2f}s"
+    )
+
+    if tokens:
+        calls = sum(t["calls"] for t in tokens)
+        prompt = sum(t["prompt_tokens"] for t in tokens)
+        completion = sum(t["completion_tokens"] for t in tokens)
+        print("\n模型调用")
+        print(f"  {calls} 次，平均每题 {calls / len(tokens):.1f} 次")
+        print(
+            f"  prompt {prompt:,} · completion {completion:,}"
+            f" · 合计 {prompt + completion:,} tokens"
+        )
+        print(f"  平均每题 {int((prompt + completion) / len(tokens)):,} tokens")
+    elif timings:
+        print("\n模型调用：参考 SQL 模式，没有调用模型")
+
+
 def _print_report(rows: list[tuple[str, str, str, str, bool, str]]) -> None:
     headers = ("题号", "类型", "问题", "结果", "说明")
     widths = [
@@ -256,7 +319,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"模式：{mode}")
         print(f"题目：{len(questions)} 道\n")
 
+        timings: list[float] = []
+        repairs: list[tuple[list[str], bool]] = []
+        tokens: list[dict[str, int]] = []
+
         for item in questions:
+            usage = getattr(generator, "usage", None)
+            before = dict(usage) if usage is not None else None
+            state: dict[str, Any] = {}
+
+            started = perf_counter()
             try:
                 state = run(
                     item["question"],
@@ -268,6 +340,14 @@ def main(argv: list[str] | None = None) -> int:
                 ok, detail = judge(item, golden, state)
             except Exception as exc:  # 单题炸了不影响其他题
                 ok, detail = False, f"{type(exc).__name__}: {exc}"[:40]
+            timings.append(perf_counter() - started)
+
+            failures = state.get("failures") or []
+            if failures:
+                repairs.append(([f["kind"] for f in failures], ok))
+
+            if usage is not None and before is not None:
+                tokens.append({key: usage[key] - before.get(key, 0) for key in usage})
 
             passed += 1 if ok else 0
             report.append(
@@ -283,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _print_report(report)
     print(f"\n通过 {passed}/{len(questions)}")
+    _print_stats(timings, repairs, tokens)
 
     if not args.model:
         print("\n注意：这是参考 SQL 模式，测的是守卫 / 执行 / 结论链路，不是模型准确率。")

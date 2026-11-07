@@ -67,6 +67,13 @@ class OpenAICompatGenerator:
         self.max_tokens = max_tokens
         #: 维度名 -> 该列在库里的真实取值，拼提示词时一并交给模型
         self.value_hints = value_hints or {}
+        #: 累计用量。评测按题做差，算单题花了几次调用、多少 token。
+        #: 只统计成功的请求 —— 抛异常的那次没有 usage 可读。
+        self.usage: dict[str, int] = {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
         self._client = OpenAI(api_key=api_key, base_url=base_url)
 
     @classmethod
@@ -132,6 +139,8 @@ class OpenAICompatGenerator:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        self._record_usage(response)
+
         choice = response.choices[0]
         content = choice.message.content or ""
 
@@ -149,6 +158,14 @@ class OpenAICompatGenerator:
             )
 
         return extract_sql(content)
+
+    def _record_usage(self, response: object) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        self.usage["calls"] += 1
+        self.usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+        self.usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
 
 
 # ---------------------------------------------------------------------------
