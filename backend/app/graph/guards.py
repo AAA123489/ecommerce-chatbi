@@ -1,13 +1,16 @@
 """SQL 守卫：在 SQL 送去执行之前，对照指标口径做静态检查。
 
 模型的活儿是「理解用户想算什么」，代码的活儿是「确认它没算错、没越界」。
-这里就是后半句 —— SQL 生成出来不直接查库，先过这五关::
+这里就是后半句 —— SQL 生成出来不直接查库，先过这六关::
 
     1. 只允许单条 SELECT            —— 防 DROP / DELETE / 多语句注入
-    2. 表达式等价于指标标准算法       —— 防模型自己改口径
-    3. 必带的过滤条件都在             —— 防漏掉 status / paid_at 把未付款订单算进来
-    4. 必带的 JOIN 条件都在           —— 防 LEFT JOIN 写成了没连上的笛卡尔积
-    5. GROUP BY 只能分组白名单维度     —— 防按 customer_id 分组泄露用户数据
+    2. 只能查语义层登记过的表          —— 防绕开口径去碰没定义过的数据
+    3. 表达式等价于指标标准算法       —— 防模型自己改口径
+    4. 必带的过滤条件都在             —— 防漏掉 status / paid_at 把未付款订单算进来
+    5. 必带的 JOIN 条件都在           —— 防 LEFT JOIN 写成了没连上的笛卡尔积
+    6. GROUP BY 只能分组白名单维度     —— 防按 customer_id 分组泄露用户数据
+
+再加一道最终投影的检查：客户标识列不许出现在结果里。
 
 全部通过才返回解析后的 AST；任何一条不过都抛 :class:`GuardError`，
 异常里带 ``code``（给程序分流）和 ``hint``（回填给模型让它改）。
@@ -94,6 +97,7 @@ def check(sql: str, spec: MetricSpec, registry: MetricRegistry) -> exp.Expressio
     node = _parse(sql)
 
     _check_select_only(node)
+    _check_tables(node, registry)
     _check_expression(node, spec, registry)
     _check_filters(node, _all_required_filters(spec, registry))
     _check_joins(node, _all_required_joins(spec, registry))
@@ -199,7 +203,62 @@ def _check_select_only(node: exp.Expression) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 第 2 关：表达式等价于指标标准算法
+# 第 2 关：只许查语义层里登记过的表
+# ---------------------------------------------------------------------------
+
+
+def _check_tables(node: exp.Expression, registry: MetricRegistry) -> None:
+    """表名必须来自 YAML。
+
+    没这一关，模型可以 `JOIN customers c ON c.customer_id = o.customer_id`
+    然后按别的东西分组 —— 敏感列在投影里会被 :func:`_check_no_leak` 拦住，
+    但「能碰到哪张表」这件事本身就该是白名单说了算，不该事后补网。
+
+    白名单不写在代码里，而是从 metrics.yaml 的 ``source`` 和 dimensions.yaml
+    的 ``source`` 里抠出来。加一张表要动 YAML，不动作业代码，两边不会漂。
+    """
+    allowed = _allowed_tables(registry)
+    ctes = {(cte.alias_or_name or "").lower() for cte in node.find_all(exp.CTE)}
+
+    for table in node.find_all(exp.Table):
+        name = (table.name or "").lower()
+        if name in ctes or name in allowed:
+            continue
+        raise GuardError(
+            "unknown_table",
+            f"SQL 引用了语义层之外的表 `{name}`",
+            hint=(
+                f"只能用这些表：{'、'.join(sorted(allowed))}。"
+                f"要用别的表，先在 metrics.yaml / dimensions.yaml 里登记。"
+            ),
+        )
+
+
+def _allowed_tables(registry: MetricRegistry) -> frozenset[str]:
+    tables: set[str] = set()
+    for spec in registry.metrics.values():
+        tables |= _tables_in(spec.source or "")
+    for dimension in registry.dimensions.values():
+        tables |= _tables_in(dimension.source or "")
+    return frozenset(tables)
+
+
+def _tables_in(fragment: str) -> set[str]:
+    """从 ``orders o JOIN order_items oi ON ...`` 这种片段里抠出表名。"""
+    fragment = fragment.strip()
+    if not fragment:
+        return set()
+    try:
+        parsed = sqlglot.parse_one(f"SELECT * FROM {fragment}", dialect=DIALECT)
+    except Exception:  # 片段写得不像 SQL（比如派生指标只写了句说明）
+        return set()
+    if parsed is None:
+        return set()
+    return {(table.name or "").lower() for table in parsed.find_all(exp.Table)}
+
+
+# ---------------------------------------------------------------------------
+# 第 3 关：表达式等价于指标标准算法
 # ---------------------------------------------------------------------------
 
 
@@ -284,7 +343,7 @@ def _is_metric_ref(node: exp.Expression, name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 第 3、4 关：必带的过滤条件 / JOIN 条件
+# 第 4、5 关：必带的过滤条件 / JOIN 条件
 # ---------------------------------------------------------------------------
 
 
@@ -350,7 +409,7 @@ def _predicate_key(expr: exp.Expression) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 第 5 关：GROUP BY 白名单
+# 第 6 关：GROUP BY 白名单
 # ---------------------------------------------------------------------------
 
 
@@ -596,6 +655,15 @@ def _demo() -> int:
             "gmv",
             f"SELECT o.customer_id, SUM(oi.quantity * oi.unit_price) AS gmv "
             f"FROM orders o {joins} WHERE {base_filter} GROUP BY 1",
+            False,
+        ),
+        (
+            "多 JOIN 一张语义层里没有的表",
+            "gmv",
+            f"SELECT SUM(oi.quantity * oi.unit_price) AS gmv "
+            f"FROM orders o {joins} "
+            f"JOIN customers c ON c.customer_id = o.customer_id "
+            f"WHERE {base_filter}",
             False,
         ),
         (

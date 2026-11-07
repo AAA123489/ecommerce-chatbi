@@ -304,7 +304,7 @@ END
 |---|---|
 | 单语句 | 多语句直接拒 |
 | 只允许 SELECT / WITH ... SELECT | DDL/DML/ATTACH/COPY/PRAGMA/LOAD 全拒 |
-| 表白名单 | 只允许 5 张业务表；系统表全拒 |
+| 表白名单 | 只允许 `metrics.yaml` / `dimensions.yaml` 的 `source` 里登记过的表（目前 `orders` / `order_items` / `products` / `refunds`）；系统表、CTE 之外的表全拒 |
 | 禁止文件函数 | `read_csv` / `read_parquet` / `glob` / `install` / `load` |
 | 强制 LIMIT | 无 LIMIT 追加 1000；已有不超过 5000 |
 | 执行隔离 | DuckDB `read_only=True`；独立线程 + 超时中断；行数上限 |
